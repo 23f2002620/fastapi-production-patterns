@@ -21,6 +21,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After", "*"],
 )
 
 # -----------------------------------------------------------------------------
@@ -52,9 +53,11 @@ client_buckets: dict[str, deque] = defaultdict(deque)
 # -----------------------------------------------------------------------------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # Allow CORS preflight requests without consuming rate limit
     if request.method == "OPTIONS":
         return await call_next(request)
 
+    # Extract client ID from X-Client-Id header (fallback to host if missing)
     client_id = (
         request.headers.get("X-Client-Id")
         or request.headers.get("x-client-id")
@@ -68,10 +71,10 @@ async def rate_limit_middleware(request: Request, call_next):
     while timestamps and timestamps[0] <= now - RATE_LIMIT_WINDOW:
         timestamps.popleft()
 
+    # Check limit exceedance
     if len(timestamps) >= RATE_LIMIT_R:
         oldest_ts = timestamps[0]
-        retry_after = int((oldest_ts + RATE_LIMIT_WINDOW) - now) + 1
-        retry_after_sec = max(1, retry_after)
+        retry_after_sec = max(1, int((oldest_ts + RATE_LIMIT_WINDOW) - now) + 1)
 
         return Response(
             content='{"detail": "Rate limit exceeded. Too many requests."}',
@@ -82,6 +85,7 @@ async def rate_limit_middleware(request: Request, call_next):
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Allow-Methods": "*",
+                "Access-Control-Expose-Headers": "Retry-After, *",
             },
         )
 
@@ -132,9 +136,7 @@ async def list_orders(limit: int = 10, cursor: Optional[str] = None):
     """
     start_after_id = decode_cursor(cursor) if cursor else 0
 
-    # Query strictly against FIXED_CATALOG
     filtered_orders = [o for o in FIXED_CATALOG if o["id"] > start_after_id]
-
     page_items = filtered_orders[:limit]
 
     next_cursor = None
