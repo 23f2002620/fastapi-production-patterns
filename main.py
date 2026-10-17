@@ -26,8 +26,8 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 # In-Memory Stores
 # -----------------------------------------------------------------------------
-# Fixed catalog pre-populated with IDs 1..50
-orders_db: list[dict[str, Any]] = [
+# Fixed catalog strictly populated with IDs 1..50
+FIXED_CATALOG: list[dict[str, Any]] = [
     {
         "id": i,
         "item": f"Production Item #{i}",
@@ -36,6 +36,9 @@ orders_db: list[dict[str, Any]] = [
     }
     for i in range(1, TOTAL_ORDERS + 1)
 ]
+
+# Separate storage for POST creation to keep FIXED_CATALOG clean
+created_orders_db: list[dict[str, Any]] = []
 
 # Idempotency key mapping: key -> order_dict
 idempotency_store: dict[str, dict[str, Any]] = {}
@@ -49,11 +52,9 @@ client_buckets: dict[str, deque] = defaultdict(deque)
 # -----------------------------------------------------------------------------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Allow CORS preflight requests without consuming rate limit
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Extract client ID from X-Client-Id header (fallback to host if missing)
     client_id = (
         request.headers.get("X-Client-Id")
         or request.headers.get("x-client-id")
@@ -63,11 +64,10 @@ async def rate_limit_middleware(request: Request, call_next):
     now = time.time()
     timestamps = client_buckets[client_id]
 
-    # Evict timestamps older than the sliding window (10 seconds)
+    # Evict timestamps older than 10 seconds
     while timestamps and timestamps[0] <= now - RATE_LIMIT_WINDOW:
         timestamps.popleft()
 
-    # Check limit exceedance
     if len(timestamps) >= RATE_LIMIT_R:
         oldest_ts = timestamps[0]
         retry_after = int((oldest_ts + RATE_LIMIT_WINDOW) - now) + 1
@@ -93,13 +93,11 @@ async def rate_limit_middleware(request: Request, call_next):
 # Helper Functions: Cursor Encoding / Decoding
 # -----------------------------------------------------------------------------
 def encode_cursor(order_id: int) -> str:
-    """Encodes an order ID into an opaque Base64 cursor string."""
     raw = f"order_cursor:{order_id}"
     return base64.urlsafe_b64encode(raw.encode()).decode()
 
 
 def decode_cursor(cursor_str: str) -> int:
-    """Decodes an opaque cursor string back into an order ID."""
     try:
         decoded = base64.urlsafe_b64decode(cursor_str.encode()).decode()
         if ":" in decoded:
@@ -130,14 +128,13 @@ class OrderCreate(BaseModel):
 async def list_orders(limit: int = 10, cursor: Optional[str] = None):
     """
     Cursor-based pagination endpoint.
-    Serves orders 1..T with opaque cursors, no gaps, no repeats.
+    Serves orders strictly from FIXED_CATALOG (IDs 1 through 50).
     """
     start_after_id = decode_cursor(cursor) if cursor else 0
 
-    # Filter items greater than the cursor ID
-    filtered_orders = [o for o in orders_db if o["id"] > start_after_id]
+    # Query strictly against FIXED_CATALOG
+    filtered_orders = [o for o in FIXED_CATALOG if o["id"] > start_after_id]
 
-    # Enforce page boundary
     page_items = filtered_orders[:limit]
 
     next_cursor = None
@@ -154,18 +151,12 @@ async def create_order(
     payload: Optional[OrderCreate] = None,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
-    """
-    Idempotent Order Creation endpoint.
-    First call creates order; repeat calls with the same key return the original order.
-    """
     key = idempotency_key or request.headers.get("idempotency-key")
 
-    # Idempotency lookup: Return existing order without creating a duplicate
     if key and key in idempotency_store:
         return idempotency_store[key]
 
-    # Create new order record
-    new_id = len(orders_db) + 1
+    new_id = TOTAL_ORDERS + len(created_orders_db) + 1
     item_name = payload.item if payload and payload.item else "Standard Widget"
     qty = payload.quantity if payload and payload.quantity else 1
 
@@ -176,7 +167,7 @@ async def create_order(
         "status": "pending",
     }
 
-    orders_db.append(new_order)
+    created_orders_db.append(new_order)
 
     if key:
         idempotency_store[key] = new_order
@@ -186,4 +177,4 @@ async def create_order(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "total_orders": len(orders_db)}
+    return {"status": "ok", "fixed_catalog_size": len(FIXED_CATALOG)}
